@@ -79,6 +79,54 @@ LIBVIRT_CONNECTION="qemu+tcp://${HOSTNAME}/system"
 # Simplify the virsh command
 VIRSH="mock-nss.sh virsh --connect ${LIBVIRT_CONNECTION}"
 
+# Ensure the lease libvirt network exists and is active before guests are created.
+# The network step can report success and still lose the network to a concurrent
+# bridge reclaim on the shared hypervisor before virt-install runs.
+ensure_libvirt_network() {
+  echo "Verifying libvirt network '${CLUSTER_NAME}' on ${LIBVIRT_CONNECTION}..."
+  ${VIRSH} net-list --all || true
+
+  if ! ${VIRSH} net-info "${CLUSTER_NAME}" >/dev/null 2>&1; then
+    if [[ ! -f "${SHARED_DIR}/network.xml" ]]; then
+      echo "ERROR: Libvirt network '${CLUSTER_NAME}' not found and ${SHARED_DIR}/network.xml is missing"
+      exit 1
+    fi
+    echo "WARNING: Libvirt network '${CLUSTER_NAME}' missing; re-defining from network.xml..."
+    local bridge_name
+    bridge_name=$(grep -oP "(?<=<bridge name=')[^']+" "${SHARED_DIR}/network.xml" || true)
+    if [[ -n "${bridge_name}" ]]; then
+      for net in $(${VIRSH} net-list --all --name 2>/dev/null); do
+        [[ -z "${net}" ]] && continue
+        local net_bridge
+        net_bridge=$(${VIRSH} net-info "${net}" 2>/dev/null | awk '/^Bridge:/{print $2}' || true)
+        if [[ "${net_bridge}" == "${bridge_name}" ]]; then
+          echo "Removing stale network '${net}' holding bridge ${bridge_name}..."
+          ${VIRSH} net-destroy "${net}" 2>/dev/null || true
+          ${VIRSH} net-undefine "${net}" 2>/dev/null || true
+        fi
+      done
+    fi
+    ${VIRSH} net-define "${SHARED_DIR}/network.xml"
+    ${VIRSH} net-autostart "${CLUSTER_NAME}" || true
+  fi
+
+  local active
+  active=$(${VIRSH} net-info "${CLUSTER_NAME}" 2>/dev/null | awk '/^Active:/{print $2}' || true)
+  if [[ "${active}" != "yes" ]]; then
+    echo "Starting libvirt network '${CLUSTER_NAME}'..."
+    ${VIRSH} net-start "${CLUSTER_NAME}"
+  fi
+
+  active=$(${VIRSH} net-info "${CLUSTER_NAME}" 2>/dev/null | awk '/^Active:/{print $2}' || true)
+  if [[ "${active}" != "yes" ]]; then
+    echo "ERROR: Libvirt network '${CLUSTER_NAME}' is not active"
+    ${VIRSH} net-list --all || true
+    ${VIRSH} net-info "${CLUSTER_NAME}" || true
+    exit 1
+  fi
+  echo "Libvirt network '${CLUSTER_NAME}' is active."
+}
+
 RHCOS_RESIZED_LOCALLY=true
 
 # Returns true when BRANCH is a numeric OCP version older than 4.16.
@@ -562,7 +610,8 @@ create_node () {
       ${VIRSH} start "${NAME}"
       ${VIRSH} autostart "${NAME}" || true
     else
-      virt-install \
+      # Use mock-nss.sh so virt-install resolves the hypervisor the same way virsh does.
+      mock-nss.sh virt-install \
         --connect ${LIBVIRT_CONNECTION} \
         --name ${NAME} \
         --memory ${DOMAIN_MEMORY} \
@@ -577,6 +626,9 @@ create_node () {
     fi
   fi
 }
+
+# Re-confirm the network immediately before guest creation (bridge reclaim races).
+ensure_libvirt_network
 
 if [ "$INSTALLER_TYPE" == "default" ]; then
   # Create the bootstrap node.

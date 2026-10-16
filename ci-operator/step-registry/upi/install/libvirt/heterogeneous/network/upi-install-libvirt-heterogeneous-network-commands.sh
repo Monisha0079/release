@@ -43,7 +43,10 @@ if [[ ! -f "${SHARED_DIR}/network.xml" ]]; then
   exit 1
 fi
 
+echo "Using libvirt connection ${REMOTE_LIBVIRT_URI}"
 echo "Defining and starting libvirt network ${CLUSTER_NAME} on primary hypervisor..."
+echo "Active networks pre creation:"
+${VIRSH} net-list --all
 
 # Both lease slots on this host share the same subnet/bridge (e.g. ocp3).
 # A stale network from a prior run on a *different* slot leaves the bridge occupied
@@ -75,5 +78,23 @@ fi
 ${VIRSH} net-define "${SHARED_DIR}/network.xml"
 ${VIRSH} net-autostart "${CLUSTER_NAME}"
 ${VIRSH} net-start "${CLUSTER_NAME}"
+
+# Fail closed if the network is not actually active (dnsmasq/bridge races).
+if ! ${VIRSH} net-info "${CLUSTER_NAME}" 2>/dev/null | grep -q '^Active:.*yes'; then
+  echo "ERROR: Libvirt network ${CLUSTER_NAME} defined but not active"
+  ${VIRSH} net-list --all || true
+  ${VIRSH} net-info "${CLUSTER_NAME}" || true
+  exit 1
+fi
+
+echo "Active networks post creation:"
+${VIRSH} net-list --all
+${VIRSH} net-info "${CLUSTER_NAME}"
+
+# Share names with later steps (install verify + additional-worker templates).
+printf '%s\n' "${CLUSTER_NAME}" > "${SHARED_DIR}/libvirt-network-name"
+if [[ -n "${BRIDGE_NAME}" ]]; then
+  printf '%s\n' "${BRIDGE_NAME}" > "${SHARED_DIR}/libvirt-bridge-name"
+fi
 
 echo "Libvirt network ${CLUSTER_NAME} successfully started."

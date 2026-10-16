@@ -420,6 +420,35 @@ fi
 ADD_COMPUTE_COUNT=$(yq-v4 -oy ".\"${LEASED_RESOURCE}\".\"additional-compute\" | length" "${LEASE_CONF}")
 echo "Provisioning ${ADD_COMPUTE_COUNT} additional ${ADDITIONAL_WORKER_ARCHITECTURE} compute nodes..."
 
+# Additional workers run on a different hypervisor than the primary NAT network.
+# Domain templates must reference a network that exists there (typically macvtap),
+# NOT the primary lease NAT network name (${LEASED_RESOURCE}).
+# Resolution order: lease network-additional → cluster-profile file → macvtap.
+ADDITIONAL_NETWORK_NAME="$(yq-v4 -oy ".\"${LEASED_RESOURCE}\".\"network-additional\"" "${LEASE_CONF}" 2>/dev/null || true)"
+if [[ -z "${ADDITIONAL_NETWORK_NAME}" || "${ADDITIONAL_NETWORK_NAME}" == "null" ]]; then
+  if [[ -f "${CLUSTER_PROFILE_DIR}/additional-network-name" ]]; then
+    ADDITIONAL_NETWORK_NAME="$(< "${CLUSTER_PROFILE_DIR}/additional-network-name")"
+  else
+    ADDITIONAL_NETWORK_NAME="macvtap"
+  fi
+fi
+ADDITIONAL_NETWORK_NAME="${ADDITIONAL_NETWORK_NAME//$'\n'/}"
+export ADDITIONAL_NETWORK_NAME
+# Compat alias for domain templates that still use ${ARM_BRIDGE_NAME}.
+export ARM_BRIDGE_NAME="${ADDITIONAL_NETWORK_NAME}"
+# Keep LEASED_RESOURCE exported for envsubst, but warn if templates misuse it as network.
+export LEASED_RESOURCE
+
+echo "Additional-worker libvirt network name: ${ADDITIONAL_NETWORK_NAME}"
+echo "Active networks on additional hypervisor:"
+${VIRSH_ADDITIONAL} net-list --all || true
+if ! ${VIRSH_ADDITIONAL} net-info "${ADDITIONAL_NETWORK_NAME}" >/dev/null 2>&1; then
+  echo "ERROR: Libvirt network '${ADDITIONAL_NETWORK_NAME}' not found on additional hypervisor ${HOSTNAME_ADDITIONAL}"
+  echo "Update cluster-profile domain templates to use network='macvtap' (or set lease network-additional),"
+  echo "and do not use source network='\${LEASED_RESOURCE}' — that NAT network exists only on the primary host."
+  exit 1
+fi
+
 for (( idx=0; idx<ADD_COMPUTE_COUNT; idx++ )); do
   node_name="${LEASED_RESOURCE}-additional-compute-${idx}"
   node_ip="$(leaseLookup "\"additional-compute\"[$idx].ip")"
@@ -462,6 +491,13 @@ for (( idx=0; idx<ADD_COMPUTE_COUNT; idx++ )); do
   # Template evaluation using envsubst and yq-v4 validation
   envsubst < "${INSTALL_TEMPLATE}" > "${domain_install_xml}"
 
+  # Catch the common secret-template mistake: referencing the primary NAT network.
+  if grep -q "network='${LEASED_RESOURCE}'\|network=\"${LEASED_RESOURCE}\"" "${domain_install_xml}"; then
+    echo "ERROR: Rendered domain XML references primary network '${LEASED_RESOURCE}' on the additional hypervisor"
+    echo "Change domain-*-template*.xml in the cluster profile to use network='\${ADDITIONAL_NETWORK_NAME}' (currently ${ADDITIONAL_NETWORK_NAME})."
+    exit 1
+  fi
+
   echo "Defining and starting install domain for ${node_name}..."
   CURRENT_INSTALL_DOMAIN="${node_name}"
   ${VIRSH_ADDITIONAL} create "${domain_install_xml}" --validate
@@ -475,6 +511,12 @@ for (( idx=0; idx<ADD_COMPUTE_COUNT; idx++ )); do
   DOMAIN_UUID="$(uuidgen)"
   export DOMAIN_UUID
   envsubst < "${RUN_TEMPLATE}" > "${domain_run_xml}"
+
+  if grep -q "network='${LEASED_RESOURCE}'\|network=\"${LEASED_RESOURCE}\"" "${domain_run_xml}"; then
+    echo "ERROR: Rendered run domain XML references primary network '${LEASED_RESOURCE}' on the additional hypervisor"
+    echo "Change domain-template*.xml in the cluster profile to use network='\${ADDITIONAL_NETWORK_NAME}' (currently ${ADDITIONAL_NETWORK_NAME})."
+    exit 1
+  fi
 
   ${VIRSH_ADDITIONAL} define "${domain_run_xml}" --validate
   ${VIRSH_ADDITIONAL} start "${node_name}"
